@@ -11,4 +11,5 @@
 gcc -c -Wall -fPIC -O3 complex.c 
 gcc -c -Wall -fPIC -O3 model_IHC.c
 gcc -c -Wall -fPIC -O3 model_Synapse.c
-gcc -shared -o libzbc2014.so complex.o model_IHC.o model_Synapse.o
+gcc -c -Wall -fPIC -O3 model_SpikeGenerator.c
+gcc -shared -o libzbc2014.so complex.o model_IHC.o model_Synapse.o model_SpikeGenerator.o
