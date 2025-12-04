@@ -48,11 +48,13 @@
 # You should have received a copy of the GNU Affero General Public License along with this
 # program. If not, see <http://www.gnu.org/licenses/>.
 
-import numpy as np
-import scipy as sp
 import ctypes
-from numpy.ctypeslib import ndpointer
 import warnings
+
+import numpy as np
+from numpy.ctypeslib import ndpointer
+import scipy as sp
+from scipy.signal import resample
 
 
 def get_lib_path():
@@ -66,188 +68,272 @@ def get_lib_path():
                 name.name.endswith('.dll')):
             lib_names.append(str(name))
 
+    # print("libnames: ", lib_names)
     if not lib_names:
-        raise FileNotFoundError("Compiled library not found.")
+        raise FileNotFoundError("Compiled library not found. check that the latest .so is in the _lib directory")
 
     # If multiple matches, return the first
     return lib_names[0]
 
-
-
-def sim_ihc_zbc2014(
-        px,
-        cf=1e3,
-        nrep=1,
-        fs=100e3,
-        cohc=1.0,
-        cihc=1.0,
-        species="human",
-):
-    """ Simulates inner-hair-cell response to sound-pressure waveform.
-
-    Performs some basic input checking and then passes sound-pressure-waveform and
-    pre-allocated output array to the C IHCAN function via the ctypes library.
-
-    Args:
-      px:
-        Sound pressure waveform (1D vector of floats, units of Pa)
-      cf:
-        Characteristic frequency (Hz)
-      nrep:
-        Number of reps to generate (only a single rep is simulated, others are appended copies)
-      fs:
-        Sampling rate (Hz)
-      cohc:
-        Status of the outer hair cells, in range of [0, 1] with 1 being fully normal/healthy
-      cihc:
-        Status of the inner hair cells, in range of [0, 1] with 1 being fully normal/healthy
-      species:
-        String, either "cat", "human", or "human-glasberg" (corresponding to MATLAB/Mex wrapper species=1, species=2, and species=3 respectively)
-
+class pyzbc2014:
+    """Class encapsulating the Zilany, Bruce, and Carney (2014) auditory-nerve model functions.
+    Provides:
+    - sim_ihc_zbc2014: Simulates inner-hair-cell response to sound-pressure waveform.
+    - sim_anrate_zbc2014: Simulates AN firing rate response to inner-hair-cell potential.
+    - sim_spike_generator_zbc2014: Simulates AN spike generation from synapse instantaneous rate output.
+    Each function performs basic input checking and then calls the corresponding C function
+    via the ctypes library.
     """
-    # First, enforce assumptions about inputs
-    assert np.ndim(px) == 1  # input is 1D vector
-    assert nrep >= 1  # number of reps is geq 1
-    assert 0 <= cohc <= 1  # C_OHC is between zero and one
-    assert 0 <= cihc <= 1  # C_IHC is between zero and one
-    assert species in ["cat", "human", "human-glasberg"]  # species is one of available options
-    if species == "cat":
-        assert .125e3 <= cf <= 40e3  # for cat, CF must be between 0.125 and 40 kHz
-    else:
-        assert .125e3 <= cf <= 20e3  # for human, CF must be between 0.125 and 20 kHz
 
-    # Emit warnings
-    if fs < 100e3:
-        warnings.warn("Note, time-domain resolution is less than recommended (sampling rate > 100 kHz, sampling period < 1e-5 s)")
+    def __init__(self):
+        # initialize by loading the library ONCE, rather than
+        # with each call to a function. This should (slightly) speed up repeated calls.
+        
+        # Open library, fetch the functions, and declare input types for call
+        lib_path = get_lib_path()
+        lib = ctypes.cdll.LoadLibrary(lib_path)
+        
+        self.IHCAN_fun = lib.IHCAN
+        self.IHCAN_fun.argtypes = [
+            ndpointer(ctypes.c_double), # input waveform ("px")
+            ctypes.c_double,            # cf
+            ctypes.c_int,               # nrep
+            ctypes.c_double,            # tdres
+            ctypes.c_int,               # totalstim
+            ctypes.c_double,            # cohc
+            ctypes.c_double,            # cihc
+            ctypes.c_int,               # species (mapped to integers)
+            ndpointer(ctypes.c_double),
+        ]
 
-    # Allocate empty storage for output
-    totalstim = len(px)
-    ihcout = np.zeros(totalstim*nrep)  # we need a vector of size totalstim*nrep to store results
+        self.Synapse_fun = lib.Synapse
+        self.Synapse_fun.argtypes = [
+            ndpointer(ctypes.c_double),  # ihcout
+            ndpointer(ctypes.c_double),  # randNums
+            ctypes.c_double,             # tdres
+            ctypes.c_double,             # cf
+            ctypes.c_int,                # totalstim
+            ctypes.c_int,                # nrep
+            ctypes.c_double,             # spont
+            ctypes.c_double,             # implnt
+            ctypes.c_double,             # sampFreq
+            ndpointer(ctypes.c_double)   # synout
+        ]
 
-    # Map from species string to species integer
-    match species:
-        case "cat":
-            species_int = 1
-        case "human":
-            species_int = 2
-        case "human-glasberg":
-            species_int = 3
+        self.SpikeGenerator_fun = lib.SpikeGenerator
+        self.SpikeGenerator_fun.argtypes = [
+            ndpointer(ctypes.c_double),  # synin
+            ndpointer(ctypes.c_double),  # randNums
+            ctypes.c_double,             # tdres
+            ctypes.c_int,                # totalstim
+            ctypes.c_int,                # nrep
+            ndpointer(ctypes.c_double),  # spkout
+        ]
 
-    # Open library, fetch IHCAN function, declare input types for call
-    lib_path = get_lib_path()
-    lib = ctypes.cdll.LoadLibrary(lib_path)
-    fun = lib.IHCAN
-    fun.argtypes = [
-        ndpointer(ctypes.c_double),
-        ctypes.c_double,
-        ctypes.c_int,
-        ctypes.c_double,
-        ctypes.c_int,
-        ctypes.c_double,
-        ctypes.c_double,
-        ctypes.c_int,
-        ndpointer(ctypes.c_double),
-    ]
+    def sim_ihc_zbc2014(
+            self,
+            px: np.ndarray,
+            cf: float = 1e3,
+            nrep: int = 1,
+            fs: float = 100e3,
+            cohc: float = 1.0,
+            cihc: float = 1.0,
+            species: str = "human",
+    ):
+        """ Simulates inner-hair-cell response to sound-pressure waveform.
 
-    # Place function call and return IHC output waveform
-    fun(px, cf, nrep, 1/fs, totalstim, cohc, cihc, species_int, ihcout)
-    return ihcout
+        Performs some basic input checking and then passes sound-pressure-waveform and
+        pre-allocated output array to the C IHCAN function via the ctypes library.
 
+        Args:
+        px: array_like
+            Sound pressure waveform (1D vector of floats, units of Pa)
+        cf: float
+            Characteristic frequency (Hz)
+        nrep: int
+            Number of reps to generate (only a single rep is simulated, others are appended copies)
+        fs: float
+            Sampling rate (Hz)
+        cohc: float
+            Status of the outer hair cells, in range of [0, 1] with 1 being fully normal/healthy
+        cihc: float
+            Status of the inner hair cells, in range of [0, 1] with 1 being fully normal/healthy
+        species: str
+            String, either "cat", "human", or "human-glasberg" 
+            (corresponding to MATLAB/Mex wrapper species=1, species=2, and species=3 respectively)
 
-def sim_anrate_zbc2014(
-        ihc,
-        cf=1e3,
-        nrep=1,
-        fs=100e3,
-        fibertype="hsr",
-        powerlaw="true",
-        noisetype="fresh",
-):
-    """ Simulates AN firing rate response to inner-hair-cell potential
+        """
+        # First, enforce assumptions about inputs
+        assert np.ndim(px) == 1  # input is 1D vector
+        assert nrep >= 1  # number of reps is geq 1
+        assert 0 <= cohc <= 1  # C_OHC is between zero and one
+        assert 0 <= cihc <= 1  # C_IHC is between zero and one
+        assert species in ["cat", "human", "human-glasberg"]  # species is one of available options
+        if species == "cat":
+            assert 0.125e3 <= cf <= 40e3  # for cat, CF must be between 0.125 and 40 kHz
+        else:
+            assert 0.125e3 <= cf <= 20e3  # for human, CF must be between 0.125 and 20 kHz
 
-    Performs some basic input checking and then passes IHC waveform and inputs to
-    the C Synapse function via the ctypes library.
+        # Emit warnings
+        if fs < 100e3:
+            warnings.warn("Note, time-domain resolution is less than recommended (sampling rate > 100 kHz, sampling period < 1e-5 s)")
 
-    Args:
-      ihc:
-        Inner-hair-cell potential (1D vector of floats, units a.u.)
-      cf:
-        Characteristic frequency (Hz)
-      nrep:
-        Number of reps to simulate (must match input to sim_ihc_zbc2014)
-      fibertype:
-        Whether to simulate high-spont ("hsr"), medium-spont ("msr"), or low-spont ("lsr") fibers
-      powerlaw:
-        Whether to use true ("true") or approximate ("approx") implementation of powerlaw adaptation
-      noisetype:
-        Whether to use no fractional Gaussian noise ("none") or fresh fractional Gaussian noise ("fresh")
-    """
-    # First, enforce assumptions about inputs
-    assert np.ndim(ihc) == 1  # input is 1D vector
-    assert nrep >= 1  # number of reps is geq 1
-    assert fibertype in ["hsr", "msr", "lsr"]
-    assert powerlaw in ["true", "approx"]
-    assert noisetype in ["none", "fresh"]
+        # Allocate empty storage for output
+        totalstim = len(px)
+        ihcout = np.zeros(totalstim*nrep)  # we need a vector of size totalstim*nrep to store results
 
-    # Second, map from fibertype string to spont value
-    match fibertype:
-        case "hsr":
-            spont = 100.0
-        case "msr":
-            spont = 4.0
-        case "lsr":
-            spont = 0.1
-
-    # Third, map from implnt string to integer value
-    match powerlaw:
-        case "true":
-            implnt = 1.0
-        case "approx":
-            implnt = 0.0
-
-    # Emit warnings
-    if fs < 100e3:
-        warnings.warn("Note, time-domain resolution is less than recommended (sampling rate > 100 kHz, sampling period < 1e-5 s)")
-
-    # Allocate empty storage for output and for noise input
-    # (length for noise input is determined based on magic equation extracted from source code)
-    synout = np.zeros(len(ihc))
-    len_noise = int(np.ceil((len(ihc) + 2 * np.floor(7500 / (cf / 1e3))) * 1/fs * 10e3))
-
-    # Synthesize fGn based on noisetype param
-    match noisetype:
-        case "none":
-            fGn = np.zeros(len_noise)
-        case "fresh":
-            fGn = ffGn(len(ihc), 1/fs, 0.9, fibertype)
-
-    # Open library, fetch IHCAN function, declare input types for call
-    lib_path = get_lib_path()
-    lib = ctypes.cdll.LoadLibrary(lib_path)
-    fun = lib.Synapse
-    fun.argtypes = [
-        ndpointer(ctypes.c_double),  # ihcout
-        ndpointer(ctypes.c_double),  # randNums
-        ctypes.c_double,             # tdres
-        ctypes.c_double,             # cf
-        ctypes.c_int,                # totalstim
-        ctypes.c_int,                # nrep
-        ctypes.c_double,             # spont
-        ctypes.c_double,             # implnt
-        ctypes.c_double,             # sampFreq
-        ndpointer(ctypes.c_double)   # synout
-    ]
-
-    # Place function call and return output waveform
-    fun(ihc, fGn, 1/fs, cf, int(len(ihc)/nrep), nrep, spont, implnt, 10e3, synout)
-
-    # Return synout passed through the pointwise nonlinearity mapping from pre-refractory
-    # to post-refractory rates
-    return synout / (1.0 + 0.75e-3 * synout)
+        # Map from species string to species integer
+        match species:
+            case "cat":
+                species_int = 1
+            case "human":
+                species_int = 2
+            case "human-glasberg":
+                species_int = 3
+            case _:
+                raise ValueError("species string not recognized, must be in ['cat', 'human', 'human-glasberg']")
+            
+        # Place function call and return IHC output waveform
+        self.IHCAN_fun(px, cf, nrep, 1.0/fs, totalstim, cohc, cihc, species_int, ihcout)
+        return ihcout
 
 
-def ffGn(N, tdres, Hinput, fibertype):
-    from scipy.signal import resample
+    def sim_anrate_zbc2014(
+            self,
+            ihc: np.ndarray,
+            cf: float = 1e3,
+            nrep: int = 1,
+            fs: float = 100e3,
+            fibertype: str = "hsr",
+            powerlaw: str = "approx",
+            noisetype: str = "fresh",
+    ):
+        """ Simulates AN firing rate response to inner-hair-cell potential
+
+        Performs some basic input checking and then passes IHC waveform and inputs to
+        the C Synapse function via the ctypes library.
+
+        Args:
+        ihc: array_like
+            Inner-hair-cell potential (1D vector of floats, units a.u., 
+            typically the output of sim_ihc_zbc2014)
+        cf: float
+            Characteristic frequency (Hz)
+        nrep: int
+            Number of reps to simulate (must match input to sim_ihc_zbc2014)
+        fibertype:
+            Whether to simulate high-spont ("hsr"), medium-spont ("msr"), or low-spont ("lsr") fibers
+        powerlaw: str
+            Whether to use true ("true") or approximate ("approx") implementation of powerlaw adaptation
+        noisetype: str
+            Whether to use no fractional Gaussian noise ("none") or fresh fractional Gaussian noise ("fresh")
+        """
+        # First, enforce assumptions about inputs
+        assert np.ndim(ihc) == 1  # input is 1D vector
+        assert nrep >= 1  # number of reps is geq 1
+        assert fibertype in ["hsr", "msr", "lsr"]
+        assert powerlaw in ["true", "approx"]
+        assert noisetype in ["none", "fresh"]
+
+        # Second, map from fibertype string to spont value
+        match fibertype:
+            case "hsr":
+                spont = 100.0
+            case "msr":
+                spont = 4.0
+            case "lsr":
+                spont = 0.1
+
+        # Third, map from implnt string to integer value
+        match powerlaw:
+            case "true":
+                implnt = 1.0
+            case "approx":
+                implnt = 0.0
+
+        # Emit warnings
+        if fs < 100e3:
+            warnings.warn("Note, time-domain resolution is less than recommended (sampling rate > 100 kHz, sampling period < 1e-5 s)")
+
+        # Allocate empty storage for output and for noise input
+        # (length for noise input is determined based on magic equation extracted from source code)
+        synout = np.zeros(len(ihc))
+        len_noise = int(np.ceil((len(ihc) + 2 * np.floor(7500 / (cf / 1e3))) * 1/fs * 10e3))
+
+        # Synthesize fGn based on noisetype param
+        match noisetype:
+            case "none":
+                fGn = np.zeros(len_noise)
+            case "fresh":
+                fGn = ffGn(len(ihc), 1/fs, 0.9, fibertype)
+        
+
+        # Place function call and return output waveform
+        self.Synapse_fun(ihc, fGn, 1/fs, cf, int(len(ihc)/nrep), nrep, spont, implnt, 10e3, synout)
+
+        # Return synout passed through the pointwise nonlinearity mapping from pre-refractory
+        # to post-refractory rates
+        return synout / (1.0 + 0.75e-3 * synout)
+
+
+    def sim_spike_generator_zbc2014(
+        self,
+        synin: np.ndarray,
+        fs: float = 100e3,
+        totalstim: float = 1.0,
+        nrep: int = 1,
+        deadtime: float = 0.00075,
+    ):
+        """Simulates AN spike generation from synapse instantaneous rate output.
+
+        Performs some basic input checking and then passes synapse output and inputs to
+        the C SpikeGenerator function via the ctypes library.
+
+        Note: The spike generator uses a fixed deadtime (refractory period) of 0.75 ms, as in the
+        original model code. The deadtime parameter here is only used to estimate the size of the
+        random number buffer needed.
+
+        Args:
+        synin: array_like
+            Synapse instantaneous rate output (1D vector of floats, units of spikes/s)
+            This usually would be the output of the function sim_anrate_zbc2014.
+        fs: float
+            Sampling rate (Hz)
+        totalstim: float
+            Total stimulus duration (s)
+        nrep: int
+            Number of reps to simulate (must match input to sim_ihc_zbc2014)
+        deadtime: float
+            Refractory period (s) between spikes (default=0.75 ms or 0.00075 s)
+        """
+        # First, enforce assumptions about inputs
+        assert np.ndim(synin) == 1  # input is 1D vector
+        assert nrep >= 1  # number of reps is geq 1
+
+        # Allocate empty storage for output
+        spkout = np.zeros(len(synin))
+
+        # Note that the "deadtime" (absolute refractory period) is currently fixed in the C code
+        # for SpikeGenerator, and cannot be changed from here.
+        # Here it is used only to estimate the size of array needed forthe random number buffer.
+
+        dead = deadtime
+
+        # DT = totalstim * 1/fs * nrep  # Total duration of the rate function
+        NoutMax = np.ceil(totalstim * nrep / dead)
+
+        # generate random numbers
+        rng = np.random.default_rng()
+        randomNums = rng.uniform(low=0.0, high=1.0, size=int(NoutMax + 1))
+
+        # Place function call and return spike times
+        self.SpikeGenerator_fun(synin, randomNums, 1.0 / fs, int(len(synin) / nrep), nrep, spkout)
+        return spkout
+
+
+def ffGn(N: int,
+        tdres: float, Hinput: float, fibertype: str):
+
     """
     Generates fractional Gaussian noise (fGn) based on the specified parameters.
 
@@ -257,20 +343,28 @@ def ffGn(N, tdres, Hinput, fibertype):
     function and a better implementation of it, see the function `ffGn_rochester` at
     https://osf.io/6bsnt/. An important note is that the parameter values listed in the 2009
     model paper (https://doi.org/10.1121/1.3238250) are incorrect, and instead the values
-    below should be use (and match was was present in the 2009/2014 code releases).
+    below should be used (and match what was present in the 2009/2014 code releases).
 
     Parameters:
-    N (int): Number of points to generate.
-    tdres (float): Time-domain resolution (i.e., 1/fs; s)
-    Hinput (float): Hurst parameter, must be in the range [0, 2].
-    spont (float): Fiber type/spont group of the AN fiber to be simulated in [hsr, msr, lsr], used to determine noise sigma
+    N:  int:
+        Number of points to generate.
+    tdres:  float:
+        Time-domain resolution (i.e., 1/fs; in units of seconds)
+    Hinput:  float:
+        Hurst parameter, must be in the range [0, 2].
+    fibertype: str
+        Fiber type/spont group of the AN fiber to be simulated in ['hsr', 'msr', 'lsr'], 
+        used to determine noise sigma.
 
     Returns:
-    np.ndarray: Array of generated noise values, of size (N, )
+    np.ndarray: 
+        Array of generated noise values, of size (N, )
     """
+
     assert (N > 0)
     assert (tdres < 1)
     assert (Hinput >= 0) and (Hinput <= 2)
+    assert fibertype in ["hsr", "msr", "lsr"]
 
     # Downsampling No. of points to match with those of Scott Jackson (tau 1e-1)
     resamp = int(np.ceil(1e-1 / tdres))
