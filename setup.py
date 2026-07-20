@@ -26,19 +26,22 @@ class build_py(build_py_orig):
             os.path.join(model_dir, "complex.c"),
             os.path.join(model_dir, "model_IHC.c"),
             os.path.join(model_dir, "model_Synapse.c"),
+            os.path.join(model_dir, "model_SpikeGenerator.c"),
         ]
         full_lib_path = os.path.join(lib_dir, so_name + ext)
-        if not os.path.exists(full_lib_path):
-            print(f"Compiling C library: {' '.join(sources)} -> {full_lib_path}")
-            if sys.platform == "win32":
-                cmd = [
-                    "gcc", "-shared", "-O3", "-o", full_lib_path, *sources
-                ]
-            else:
-                cmd = [
-                    "gcc", "-fPIC", "-O3", "-shared", "-o", full_lib_path, *sources
-                ]
-            subprocess.check_call(cmd)
+        # Always (re)compile for the platform doing the build. A stale binary
+        # left over from a different OS/arch (e.g. checked out or copied from
+        # another machine) must never be silently reused.
+        print(f"Compiling C library: {' '.join(sources)} -> {full_lib_path}")
+        if sys.platform == "win32":
+            cmd = [
+                "gcc", "-shared", "-O3", "-o", full_lib_path, *sources
+            ]
+        else:
+            cmd = [
+                "gcc", "-fPIC", "-O3", "-shared", "-o", full_lib_path, *sources
+            ]
+        subprocess.check_call(cmd)
         super().run()
 
 class bdist_wheel(_bdist_wheel):
