@@ -165,7 +165,7 @@ int SpikeGenerator(double *synouttmp, double *randNums, double tdres, int totals
 
     // free(randNums);  # array came from outside, so nothing to free. 
     nspikes = Nout; /* Number of spikes that occurred. */
-    return (sptime);
+    return nspikes;
 }
 
 
