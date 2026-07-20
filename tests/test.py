@@ -16,7 +16,7 @@ boolean variable to True/False.
 """
 
 import numpy as np
-import pyzbc2014.pyzbc2014 as pyzbc2014
+from pyzbc2014 import pyzbc2014 as PyZBC2014Model
 import matplotlib.pyplot as plt
 
 species = "cat"
@@ -28,7 +28,7 @@ Fs = 100e3  # Sampling frequency
 stimwin = [0.25, 0.25 + 0.5]
 t_max = 1.0  # seconds
 
-zbc = pyzbc2014.pyzbc2014()  # create an instance of the model, and load the shared libraries.
+zbc = PyZBC2014Model()  # create an instance of the model, and load the shared libraries.
 
 
 def compute_stimulus(
